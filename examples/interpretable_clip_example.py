@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import sys
 import os
 import numpy as np
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 # Add the parent directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,7 +27,7 @@ def main():
         return
     
     # Example text (change as needed)
-    text = "a photo of a cat and a dog"
+    text = "A photo of a dog"
     
     # Visualize patch grid to verify patch ordering
     print("Visualizing patch grid to verify patch ordering...")
@@ -56,7 +57,29 @@ def main():
     print("\nVisualizing overall patch similarity...")
     model.visualize_overall_patch_heatmap(image, text, agg="mean", debug=True)
     
-    print("\nComplete! You can now interpret which image regions respond most strongly to each token.")
+    print("\nFinished!")
+
+    fig, axs = plt.subplots(1, 3, figsize=(24, 6))
+
+    # Original image
+    axs[0].imshow(image)
+    axs[0].set_title("Original Image")
+    axs[0].axis('off')
+
+    sim_np = similarity.detach().cpu().numpy()
+    # Raw similarity overlay
+    axs[1].imshow(sim_np, cmap='coolwarm', alpha=0.5)
+    axs[1].set_title("Raw Similarity Overlay\n(Red=Positive, Blue=Negative)")
+    axs[1].axis('off')
+
+    # Absolute similarity overlay
+    axs[2].imshow(np.abs(sim_np), cmap='hot', alpha=0.5)
+    axs[2].set_title("Absolute Similarity Overlay\n(Magnitude Only)")
+    axs[2].axis('off')
+
+    # Adjust layout to push colorbars to the far right
+    plt.subplots_adjust(left=0.05, right=0.75, top=0.9, bottom=0.1, wspace=0.2)
+    plt.show()
 
 if __name__ == "__main__":
     main() 
