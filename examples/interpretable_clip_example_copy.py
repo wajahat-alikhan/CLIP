@@ -1,7 +1,4 @@
-#Visualizing the similarity of each token with the image
-#The image have not global similarity
-
-
+#Global Similarity
 
 import torch
 from PIL import Image
@@ -32,7 +29,7 @@ def main():
         return
     
     # Example text (change as needed)
-    text = "Not a photo of a cat"
+    text = "A photo of a cat"
     
     # Compute token-patch similarity
     print("Computing token-patch similarity...")
@@ -41,19 +38,21 @@ def main():
         tokenize([text])
     )
     
-    # Create three-panel visualization for each token using the model's built-in visualization
+    # Calculate global min/max for consistent scaling across all tokens
+    sim_np = similarity.detach().cpu().numpy()
+    global_min_raw = sim_np.min()
+    global_max_raw = sim_np.max()
+    global_min_abs = 0  # Absolute values always start from 0
+    global_max_abs = np.abs(sim_np).max()
+    
+    print(f"Global similarity range: {global_min_raw:.4f} to {global_max_raw:.4f}")
+    print(f"Global absolute similarity range: {global_min_abs:.4f} to {global_max_abs:.4f}")
+    
+    # Create three-panel visualization for each token using consistent scaling
     print("\nCreating three-panel visualizations for each token...")
     
     for i, token in enumerate(tokens):
         print(f"\nCreating visualization for token '{token}'...")
-        
-        # Create three-panel figure for this token
-        fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Original image
-        axs[0].imshow(image)
-        axs[0].set_title("Original Image")
-        axs[0].axis('off')
         
         # Extract this token's similarity and create smooth heatmaps
         token_sim = similarity[i].detach().cpu().numpy()
@@ -82,27 +81,46 @@ def main():
             raw_heatmap_resized = raw_heatmap
             abs_heatmap_resized = abs_heatmap
         
-        # Raw similarity overlay for this token
+        # Create three-panel figure for this token
+        fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Original image
+        axs[0].imshow(image)
+        axs[0].set_title("Original Image")
+        axs[0].axis('off')
+        
+        # Raw similarity overlay for this token with FIXED scale
         axs[1].imshow(image)
-        im1 = axs[1].imshow(raw_heatmap_resized, cmap='coolwarm', alpha=0.5)
+        im1 = axs[1].imshow(raw_heatmap_resized, cmap='coolwarm', alpha=0.5, 
+                           vmin=global_min_raw, vmax=global_max_raw)
         axs[1].set_title(f"Raw Similarity for Token: '{token}'\n(Red=Positive, Blue=Negative)")
         axs[1].axis('off')
         
-        # Add colorbar for raw similarity
+        # Add colorbar for raw similarity with FIXED scale
         divider1 = make_axes_locatable(axs[1])
         cax1 = divider1.append_axes("right", size="5%", pad=0.1)
-        plt.colorbar(im1, cax=cax1)
+        cbar1 = plt.colorbar(im1, cax=cax1)
+        cbar1.set_label('Similarity', rotation=270, labelpad=15)
         
-        # Absolute similarity overlay for this token
+        # Absolute similarity overlay for this token with FIXED scale
         axs[2].imshow(image)
-        im2 = axs[2].imshow(abs_heatmap_resized, cmap='hot', alpha=0.5)
+        im2 = axs[2].imshow(abs_heatmap_resized, cmap='hot', alpha=0.5,
+                           vmin=global_min_abs, vmax=global_max_abs)
         axs[2].set_title(f"Absolute Similarity for Token: '{token}'\n(Magnitude Only)")
         axs[2].axis('off')
         
-        # Add colorbar for absolute similarity
+        # Add colorbar for absolute similarity with FIXED scale
         divider2 = make_axes_locatable(axs[2])
         cax2 = divider2.append_axes("right", size="5%", pad=0.1)
-        plt.colorbar(im2, cax=cax2)
+        cbar2 = plt.colorbar(im2, cax=cax2)
+        cbar2.set_label('|Similarity|', rotation=270, labelpad=15)
+        
+        # Print this token's actual similarity range for debugging
+        token_min = token_sim.min()
+        token_max = token_sim.max()
+        token_abs_max = np.abs(token_sim).max()
+        print(f"  Token '{token}' similarity range: {token_min:.4f} to {token_max:.4f}")
+        print(f"  Token '{token}' absolute max: {token_abs_max:.4f}")
         
         # Adjust layout
         plt.tight_layout()
