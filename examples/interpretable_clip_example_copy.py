@@ -1,4 +1,4 @@
-#Global Similarity
+# Global Similarity
 
 import torch
 from PIL import Image
@@ -19,7 +19,7 @@ def main():
     model = load_interpretable_clip("ViT-B/32")
     
     # Load and preprocess image
-    image_path = "D:/Wajahat Ali Khan/CLIP/cat.png"
+    image_path = "D:/Wajahat Ali Khan/CLIP/MRI.png"
     try:
         image = Image.open(image_path)
         print(f"Successfully loaded image from: {image_path}")
@@ -29,7 +29,7 @@ def main():
         return
     
     # Example text (change as needed)
-    text = "A photo of a cat"
+    text = "MRI scan of a 84.8 years old male"
     
     # Compute token-patch similarity
     print("Computing token-patch similarity...")

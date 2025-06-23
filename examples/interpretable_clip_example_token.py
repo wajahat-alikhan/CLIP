@@ -22,7 +22,7 @@ def main():
     model = load_interpretable_clip("ViT-B/32")
     
     # Load and preprocess image
-    image_path = "D:/Wajahat Ali Khan/CLIP/cat.png"
+    image_path = "D:/Wajahat Ali Khan/CLIP/PET.png"
     try:
         image = Image.open(image_path)
         print(f"Successfully loaded image from: {image_path}")
@@ -32,7 +32,7 @@ def main():
         return
     
     # Example text (change as needed)
-    text = "Not a photo of a cat"
+    text = "PET scan of a 84.8 years old male"
     
     # Compute token-patch similarity
     print("Computing token-patch similarity...")
