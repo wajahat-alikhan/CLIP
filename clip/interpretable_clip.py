@@ -1,10 +1,10 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image
+from typing import Tuple, List
 import matplotlib.pyplot as plt
-from typing import Tuple, List, Optional
 import cv2
+from PIL import Image
 
 from .model import CLIP, VisionTransformer
 from .clip import load, tokenize
@@ -13,6 +13,13 @@ class InterpretableVisionTransformer(VisionTransformer):
     """Modified VisionTransformer that returns patch embeddings."""
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass that returns both CLS token embedding and patch embeddings.
+        
+        Returns:
+            cls_embedding: [batch_size, embed_dim] - CLS token embedding (for image-level tasks)
+            patch_embeddings: [batch_size, num_patches, embed_dim] - Individual patch embeddings
+        """
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -24,13 +31,18 @@ class InterpretableVisionTransformer(VisionTransformer):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         
-        # Get patch embeddings (excluding CLS token)
-        patch_embeddings = x[:, 1:, :]
+        # Apply layer norm and projection to both CLS and patch tokens
+        # This ensures they're in the same semantic space as CLIP's contrastive learning
         
-        # Get CLS token embedding
+        # CLS token (index 0) - standard CLIP image embedding
         cls_embedding = self.ln_post(x[:, 0, :])
         if self.proj is not None:
             cls_embedding = cls_embedding @ self.proj
+            
+        # Patch tokens (index 1:) - individual patch embeddings with same processing
+        patch_embeddings = self.ln_post(x[:, 1:, :])  
+        if self.proj is not None:
+            patch_embeddings = patch_embeddings @ self.proj
             
         return cls_embedding, patch_embeddings
 
@@ -51,7 +63,18 @@ class InterpretableCLIP(CLIP):
             )
     
     def encode_text_with_tokens(self, text: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode text and return both pooled embedding and token embeddings."""
+        """
+        Encode text and return both pooled embedding and individual token embeddings.
+        
+        Args:
+            text: [batch_size, sequence_length] tokenized text
+            
+        Returns:
+            pooled_embedding: [batch_size, embed_dim] - standard CLIP text embedding
+            token_embeddings: [batch_size, sequence_length, embed_dim] - individual token embeddings
+        """
+        text = text.to(next(self.parameters()).device)
+        
         x = self.token_embedding(text).type(self.dtype)
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -59,240 +82,427 @@ class InterpretableCLIP(CLIP):
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
         
-        # Get token embeddings before pooling
+        # Individual token embeddings (before pooling)
         token_embeddings = x
         
-        # Get pooled embedding
+        # Standard CLIP pooled embedding (take features from the eot embedding)
         pooled_embedding = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         
         return pooled_embedding, token_embeddings
     
     def encode_image_with_patches(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode image and return both pooled embedding and patch embeddings."""
+        """
+        Encode image and return both pooled embedding and patch embeddings.
+        
+        Args:
+            image: [batch_size, 3, height, width] preprocessed image
+            
+        Returns:
+            pooled_embedding: [batch_size, embed_dim] - standard CLIP image embedding
+            patch_embeddings: [batch_size, num_patches, embed_dim] - individual patch embeddings
+        """
+        image = image.to(next(self.visual.parameters()).device)
         return self.visual(image.type(self.dtype))
     
-    def get_token_patch_similarity(self, image: torch.Tensor, text: torch.Tensor) -> Tuple[List[str], torch.Tensor]:
-        """Compute similarity between each real text token and each real image patch (exclude special tokens and CLS)."""
-        print("[DEBUG] Input image shape:", image.shape)
-        print("[DEBUG] Input text shape:", text.shape)
-        # Get patch embeddings (exclude CLS)
-        _, patch_embeddings = self.encode_image_with_patches(image)  # [batch, num_patches, dim]
-        # Get token embeddings (all tokens)
-        _, token_embeddings = self.encode_text_with_tokens(text)  # [batch, num_tokens, dim]
-        print("[DEBUG] Patch embeddings shape (before projection):", patch_embeddings.shape)
-        print("[DEBUG] Token embeddings shape (before projection):", token_embeddings.shape)
-        # Project embeddings to same dimension
-        if hasattr(self.visual, 'proj') and self.visual.proj is not None:
-            patch_embeddings_proj = torch.matmul(patch_embeddings, self.visual.proj)
-        else:
-            patch_embeddings_proj = patch_embeddings
-        if hasattr(self, 'text_projection') and self.text_projection is not None:
-            token_embeddings_proj = torch.matmul(token_embeddings, self.text_projection)
-        else:
-            token_embeddings_proj = token_embeddings
-        print("[DEBUG] Patch embeddings shape (after projection):", patch_embeddings_proj.shape)
-        print("[DEBUG] Token embeddings shape (after projection):", token_embeddings_proj.shape)
-        # Normalize embeddings
-        patch_embeddings_proj = F.normalize(patch_embeddings_proj, dim=-1)
-        token_embeddings_proj = F.normalize(token_embeddings_proj, dim=-1)
-        print("[DEBUG] Patch embeddings shape (after normalization):", patch_embeddings_proj.shape)
-        print("[DEBUG] Token embeddings shape (after normalization):", token_embeddings_proj.shape)
-        # Get token strings using convert_ids_to_tokens if available
+    def get_token_patch_similarity(self, image: torch.Tensor, text: torch.Tensor, debug: bool = False) -> Tuple[List[str], torch.Tensor]:
+        """
+        Compute pure cosine similarity between text tokens and image patches in CLIP's latent space.
+        
+        Args:
+            image: [batch_size, 3, height, width] preprocessed image
+            text: [batch_size, sequence_length] tokenized text
+            debug: whether to print debug information
+            
+        Returns:
+            tokens: List of meaningful token strings (excluding special tokens)
+            similarity: [num_tokens, num_patches] cosine similarity matrix
+        """
+        if debug:
+            print(f"Input image shape: {image.shape}")
+            print(f"Input text shape: {text.shape}")
+        
+        # Get embeddings in CLIP's projected space
+        _, patch_embeddings = self.encode_image_with_patches(image)  # [batch, num_patches, embed_dim]
+        _, token_embeddings = self.encode_text_with_tokens(text)     # [batch, seq_len, embed_dim]
+        
+        if debug:
+            print(f"Patch embeddings shape: {patch_embeddings.shape}")
+            print(f"Token embeddings shape: {token_embeddings.shape}")
+        
+        # Project token embeddings to the same space as patch embeddings
+        token_embeddings_proj = torch.matmul(token_embeddings, self.text_projection)
+        
+        if debug:
+            print(f"Token embeddings projected shape: {token_embeddings_proj.shape}")
+        
+        # L2 normalize both embeddings for cosine similarity
+        patch_embeddings_norm = F.normalize(patch_embeddings, dim=-1)
+        token_embeddings_norm = F.normalize(token_embeddings_proj, dim=-1)
+        
+        # Get token strings and filter out special tokens
         if hasattr(self.tokenizer, 'convert_ids_to_tokens'):
             all_tokens = self.tokenizer.convert_ids_to_tokens([t.cpu().item() for t in text[0]])
         else:
             all_tokens = [self.tokenizer.decode([t.cpu().item()]) for t in text[0]]
-        # Remove special tokens (BOS, EOS, padding) by both ID and string
-        special_token_strings = {"<|startoftext|>", "<|endoftext|>"}
+        
+        # Filter out special tokens and padding
+        special_token_strings = {"<|startoftext|>", "<|endoftext|>", "!"}
         special_ids = set()
         if hasattr(self.tokenizer, 'all_special_ids'):
             special_ids = set(self.tokenizer.all_special_ids)
-        real_token_indices = [
-            i for i, (tok_id, tok_str) in enumerate(zip(text[0], all_tokens))
-            if (tok_id.cpu().item() not in special_ids and tok_str.strip() != '!' and tok_str not in special_token_strings)
-        ]
-        tokens = [all_tokens[i] for i in real_token_indices]
-        print("[DEBUG] Real tokens:", tokens)
-        # Select only real token embeddings
-        token_embeddings_proj = token_embeddings_proj[0, real_token_indices, :]
-        # Compute similarity matrix (real tokens x all patches)
-        similarity = torch.matmul(token_embeddings_proj, patch_embeddings_proj[0].transpose(0, 1))  # [num_real_tokens, num_patches]
-        print("[DEBUG] Similarity matrix shape:", similarity.shape)
-        # Patch grid shape assertion
-        grid_size = int(np.sqrt(similarity.shape[-1]))
-        assert grid_size * grid_size == similarity.shape[-1], f"Expected square patch grid, got {similarity.shape[-1]}"
-        return tokens, similarity  # Only real tokens, all real patches
-    
-    @staticmethod
-    def find_token_indices(tokens, query):
-        """Return a list of indices where the token contains the query substring (case-insensitive)."""
-        return [i for i, t in enumerate(tokens) if query.lower() in t.lower()]
-
-    def visualize_token_patch_similarity(self, image: Image.Image, text: str, token_idx: Optional[int] = None):
-        """Visualize token-patch similarities for all tokens or a specific token index."""
-        with torch.no_grad():
-            image_input = self.preprocess(image).unsqueeze(0)
-            text_input = tokenize([text])
-            tokens, similarity = self.get_token_patch_similarity(image_input, text_input)
-            similarity = similarity.detach().cpu().numpy()
-            patch_size = self.visual.conv1.kernel_size[0]
-            grid_size = int(np.sqrt(similarity.shape[1]))
-
-            if token_idx is not None:
-                plt.figure(figsize=(10, 4))
-                plt.subplot(1, 2, 1)
-                plt.imshow(image)
-                plt.axis('off')
-                plt.title('Input Image')
-                plt.subplot(1, 2, 2)
-                heatmap = similarity[token_idx].reshape(grid_size, grid_size)
-                plt.imshow(heatmap, cmap='viridis')
-                plt.colorbar()
-                plt.title(f'Similarity for token: {tokens[token_idx]} (idx={token_idx})')
-                plt.axis('off')
-            else:
-                n_tokens = len(tokens)
-                n_cols = min(4, n_tokens+1)
-                n_rows = ((n_tokens + 1) + n_cols - 1) // n_cols  # +1 for the image
-                plt.figure(figsize=(4*n_cols, 4*n_rows))
-                plt.subplot(n_rows, n_cols, 1)
-                plt.imshow(image)
-                plt.axis('off')
-                plt.title('Input Image')
-                for i, token in enumerate(tokens):
-                    plt.subplot(n_rows, n_cols, i + 2)
-                    heatmap = similarity[i].reshape(grid_size, grid_size)
-                    plt.imshow(heatmap, cmap='viridis')
-                    plt.colorbar()
-                    plt.title(f'Token: {token}\n(idx={i})')
-                    plt.axis('off')
-            plt.tight_layout()
-            plt.show()
-
-    def visualize_token_patch_overlay(self, image: Image.Image, text: str, token: str = None, token_idx: int = None, alpha: float = 0.5):
-        """Overlay the patch similarity heatmap for a selected token on the image."""
-        with torch.no_grad():
-            image_input = self.preprocess(image).unsqueeze(0)
-            text_input = tokenize([text])
-            tokens, similarity = self.get_token_patch_similarity(image_input, text_input)
-            similarity = similarity.detach().cpu().numpy()
-            patch_size = self.visual.conv1.kernel_size[0]
-            grid_size = int(np.sqrt(similarity.shape[1]))
-            if token_idx is None and token is not None:
-                matches = self.find_token_indices(tokens, token)
-                if not matches:
-                    raise ValueError(f"No token containing '{token}' found. Available tokens: {tokens}")
-                token_idx = matches[0]
-            if token_idx is None:
-                raise ValueError("Token or token_idx must be specified and found in tokens.")
-            heatmap = similarity[token_idx].reshape(grid_size, grid_size)
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-            img_w, img_h = image.size
-            heatmap_resized = cv2.resize(heatmap, (img_w, img_h), interpolation=cv2.INTER_CUBIC)
-            plt.figure(figsize=(8, 8))
-            plt.imshow(image)
-            plt.imshow(heatmap_resized, cmap='jet', alpha=alpha)
-            plt.axis('off')
-            plt.title(f"Token: {tokens[token_idx]} (idx={token_idx})")
-            plt.colorbar(label='Similarity')
-            plt.show()
-
-    def plot_token_importance(self, image: Image.Image, text: str):
-        """Plot a bar chart of average similarity for each token."""
-        with torch.no_grad():
-            image_input = self.preprocess(image).unsqueeze(0)
-            text_input = tokenize([text])
-            tokens, similarity = self.get_token_patch_similarity(image_input, text_input)
-            similarity = similarity.detach().cpu().numpy()
-            avg_sim = similarity[:len(tokens)].mean(axis=1)
-            plt.figure(figsize=(max(10, len(tokens)), 4))
-            plt.bar(tokens, avg_sim)
-            plt.ylabel('Average Patch Similarity')
-            plt.xlabel('Token')
-            plt.title('Token Importance (Average Similarity)')
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            plt.show()
-
-    def visualize_all_token_patch_overlays(self, image: Image.Image, text: str, alpha: float = 0.5, max_cols: int = 4):
-        """Overlay patch similarity heatmaps for all real tokens in a single figure for easy comparison."""
-        print("[DEBUG] Visualizing all token patch overlays...")
-        with torch.no_grad():
-            image_input = self.preprocess(image).unsqueeze(0)
-            text_input = tokenize([text])
-            tokens, similarity = self.get_token_patch_similarity(image_input, text_input)
-            similarity = similarity.detach().cpu().numpy()
-            patch_size = self.visual.conv1.kernel_size[0]
-            grid_size = int(np.sqrt(similarity.shape[1]))
-            img_w, img_h = image.size
-            n_tokens = len(tokens)
-            n_cols = min(max_cols, n_tokens)
-            n_rows = (n_tokens + n_cols - 1) // n_cols
-            plt.figure(figsize=(4*n_cols, 4*n_rows))
-            for i, token in enumerate(tokens):
-                heatmap = similarity[i].reshape(grid_size, grid_size)
-                heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-                heatmap_resized = cv2.resize(heatmap, (img_w, img_h), interpolation=cv2.INTER_CUBIC)
-                plt.subplot(n_rows, n_cols, i + 1)
-                plt.imshow(image)
-                plt.imshow(heatmap_resized, cmap='jet', alpha=alpha)
-                plt.axis('off')
-                plt.title(repr(token), fontsize=10, y=1.02)
-            plt.tight_layout()
-            plt.show()
-            print("[DEBUG] All token overlays visualized.")
+        
+        real_token_indices = []
+        for i, (tok_id, tok_str) in enumerate(zip(text[0], all_tokens)):
+            tok_str_stripped = tok_str.strip()
+            if (tok_id.cpu().item() not in special_ids and 
+                tok_str_stripped and 
+                tok_str_stripped != '!' and 
+                tok_str_stripped not in special_token_strings):
+                real_token_indices.append(i)
+        
+        # Extract meaningful tokens
+        tokens = [all_tokens[i].strip() for i in real_token_indices]
+        token_embeddings_real = token_embeddings_norm[0, real_token_indices, :]
+        
+        if debug:
+            print(f"Real tokens: {tokens}")
+            print(f"Real token embeddings shape: {token_embeddings_real.shape}")
+        
+        # Compute cosine similarity matrix: [num_real_tokens, num_patches]
+        similarity = torch.matmul(token_embeddings_real, patch_embeddings_norm[0].transpose(0, 1))
+        
+        if debug:
+            print(f"Similarity matrix shape: {similarity.shape}")
+            print(f"Similarity range: [{similarity.min().item():.4f}, {similarity.max().item():.4f}]")
+        
+        return tokens, similarity
 
     def plot_token_patch_matrix(self, tokens, similarity):
-        # Ensure similarity is a NumPy array
+        """
+        Plots the token-patch similarity matrix as a heatmap (confusion matrix style).
+        This shows the cosine similarity between every image patch and every text token.
+        """
         if hasattr(similarity, 'detach'):
             similarity = similarity.detach().cpu().numpy()
-        plt.figure(figsize=(10, max(4, len(tokens) * 0.5)))
-        plt.imshow(similarity, aspect='auto', cmap='viridis')
-        plt.colorbar(label='Cosine Similarity')
+
+        plt.figure(figsize=(12, max(4, len(tokens) * 0.4)))
+        
+        # Find the maximum absolute value for symmetric color scaling
+        vmax = np.max(np.abs(similarity))
+        
+        plt.imshow(similarity, aspect='auto', cmap='coolwarm', vmin=-vmax, vmax=vmax)
+        
         plt.yticks(np.arange(len(tokens)), [str(t) for t in tokens])
-        plt.xlabel('Patch Index')
-        plt.ylabel('Token')
-        plt.title('Token-Patch Similarity Matrix')
+        plt.xlabel("Image Patch Index")
+        plt.ylabel("Text Token")
+        plt.title("Token-Patch Cosine Similarity Matrix")
+        
+        cbar = plt.colorbar()
+        cbar.set_label("Cosine Similarity")
+        
         plt.tight_layout()
         plt.show()
 
+    def visualize_text_impact_on_image(self, image: Image.Image, similarity: torch.Tensor, 
+                                       alpha: float = 0.6, gaussian_sigma: float = 3.0, 
+                                       colormap: str = 'viridis', use_positive_only: bool = True):
+        """
+        Creates a smooth, gradient-style saliency heatmap overlaid on the image.
+        This produces the type of visualization commonly seen in interpretability research
+        with smooth color transitions and natural blending.
+
+        Args:
+            image (Image.Image): The original PIL image for visualization.
+            similarity (torch.Tensor): The [num_tokens, num_patches] similarity matrix.
+            alpha (float): The transparency of the heatmap overlay (0.0 = transparent, 1.0 = opaque).
+            gaussian_sigma (float): Standard deviation for Gaussian smoothing (higher = smoother).
+            colormap (str): Matplotlib colormap name ('viridis', 'plasma', 'hot', 'jet', 'coolwarm', etc.).
+            use_positive_only (bool): If True, only shows positive similarities for cleaner visualization.
+        """
+        if hasattr(similarity, 'detach'):
+            similarity = similarity.detach().cpu().numpy()
+
+        # Average the similarity scores across all tokens for each patch
+        patch_impact_scores = np.mean(similarity, axis=0)
+        
+        # If using positive only, clip negative values to zero
+        if use_positive_only:
+            patch_impact_scores = np.maximum(patch_impact_scores, 0)
+        
+        grid_size = int(np.sqrt(patch_impact_scores.shape[0]))
+        heatmap = patch_impact_scores.reshape(grid_size, grid_size)
+
+        # Resize the small heatmap to the full image size using cubic interpolation for smoother results
+        img_w, img_h = image.size
+        heatmap_resized = cv2.resize(heatmap, (img_w, img_h), interpolation=cv2.INTER_CUBIC)
+
+        # Apply Gaussian smoothing for that gradient-like effect
+        # Convert sigma to kernel size (rule of thumb: kernel_size = 6*sigma + 1)
+        kernel_size = int(6 * gaussian_sigma + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1  # Ensure odd kernel size
+        
+        heatmap_smooth = cv2.GaussianBlur(heatmap_resized, (kernel_size, kernel_size), gaussian_sigma)
+
+        # Normalize the heatmap to [0, 1] for better color mapping
+        if use_positive_only:
+            heatmap_norm = (heatmap_smooth - heatmap_smooth.min()) / (heatmap_smooth.max() - heatmap_smooth.min() + 1e-8)
+        else:
+            # For symmetric normalization when including negative values
+            vmax = np.max(np.abs(heatmap_smooth))
+            heatmap_norm = (heatmap_smooth + vmax) / (2 * vmax + 1e-8)
+
+        # Create the visualization
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # Display the original image
+        ax.imshow(image)
+        
+        # Create and overlay the smooth heatmap
+        if use_positive_only:
+            im = ax.imshow(heatmap_norm, cmap=colormap, alpha=alpha, vmin=0, vmax=1)
+        else:
+            vmax_display = np.max(np.abs(heatmap_smooth))
+            im = ax.imshow(heatmap_smooth, cmap=colormap, alpha=alpha, vmin=-vmax_display, vmax=vmax_display)
+
+        # Clean styling for professional appearance
+        ax.axis('off')
+        
+        # Add colorbar with proper labeling
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if use_positive_only:
+            cbar.set_label("Text-Image Similarity", fontsize=12)
+        else:
+            cbar.set_label("Text-Image Cosine Similarity", fontsize=12)
+        
+        plt.tight_layout()
+        plt.show()
+
+    def visualize_gradient_heatmap(self, image: Image.Image, similarity: torch.Tensor, style: str = 'research'):
+        """
+        Alternative visualization function that creates different styles of gradient heatmaps.
+        
+        Args:
+            image: PIL Image
+            similarity: token-patch similarity matrix
+            style: 'research' (viridis), 'thermal' (hot), 'attention' (plasma), or 'classic' (jet)
+        """
+        style_configs = {
+            'research': {'colormap': 'viridis', 'alpha': 0.6, 'sigma': 4.0},
+            'thermal': {'colormap': 'hot', 'alpha': 0.7, 'sigma': 3.5},
+            'attention': {'colormap': 'plasma', 'alpha': 0.6, 'sigma': 4.5},
+            'classic': {'colormap': 'jet', 'alpha': 0.5, 'sigma': 3.0}
+        }
+        
+        config = style_configs.get(style, style_configs['research'])
+        
+        print(f"Creating {style}-style gradient heatmap...")
+        self.visualize_text_impact_on_image(
+            image, similarity, 
+            alpha=config['alpha'], 
+            gaussian_sigma=config['sigma'],
+            colormap=config['colormap'],
+            use_positive_only=True
+        )
+
+    def visualize_individual_token_impacts(self, image: Image.Image, tokens: List[str], similarity: torch.Tensor,
+                                          alpha: float = 0.6, gaussian_sigma: float = 3.0, 
+                                          colormap: str = 'plasma', use_positive_only: bool = True,
+                                          max_cols: int = 3):
+        """
+        Creates separate gradient heatmaps for each individual token's impact on the image.
+        This shows how each word in the text prompt affects different regions of the image.
+        
+        Args:
+            image (Image.Image): The original PIL image for visualization.
+            tokens (List[str]): List of meaningful tokens from the text.
+            similarity (torch.Tensor): The [num_tokens, num_patches] similarity matrix.
+            alpha (float): The transparency of the heatmap overlay.
+            gaussian_sigma (float): Standard deviation for Gaussian smoothing.
+            colormap (str): Matplotlib colormap name.
+            use_positive_only (bool): If True, only shows positive similarities.
+            max_cols (int): Maximum number of columns in the subplot grid.
+        """
+        if hasattr(similarity, 'detach'):
+            similarity = similarity.detach().cpu().numpy()
+        
+        num_tokens = len(tokens)
+        if num_tokens == 0:
+            print("No meaningful tokens to visualize.")
+            return
+        
+        # Calculate grid dimensions
+        cols = min(max_cols, num_tokens)
+        rows = (num_tokens + cols - 1) // cols  # Ceiling division
+        
+        # Create subplots
+        fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows))
+        if rows == 1 and cols == 1:
+            axes = [axes]
+        elif rows == 1 or cols == 1:
+            axes = axes.flatten()
+        else:
+            axes = axes.flatten()
+        
+        # Get image dimensions
+        img_w, img_h = image.size
+        grid_size = int(np.sqrt(similarity.shape[1]))
+        
+        # Process each token
+        for i, (token, ax) in enumerate(zip(tokens, axes)):
+            # Get similarity scores for this specific token
+            token_similarities = similarity[i, :]
+            
+            # Apply positive-only filtering if requested
+            if use_positive_only:
+                token_similarities = np.maximum(token_similarities, 0)
+            
+            # Reshape to spatial grid
+            heatmap = token_similarities.reshape(grid_size, grid_size)
+            
+            # Resize and smooth
+            heatmap_resized = cv2.resize(heatmap, (img_w, img_h), interpolation=cv2.INTER_CUBIC)
+            
+            # Apply Gaussian smoothing
+            kernel_size = int(6 * gaussian_sigma + 1)
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            
+            heatmap_smooth = cv2.GaussianBlur(heatmap_resized, (kernel_size, kernel_size), gaussian_sigma)
+            
+            # Normalize the heatmap
+            if use_positive_only:
+                if heatmap_smooth.max() > heatmap_smooth.min():
+                    heatmap_norm = (heatmap_smooth - heatmap_smooth.min()) / (heatmap_smooth.max() - heatmap_smooth.min())
+                else:
+                    heatmap_norm = heatmap_smooth
+            else:
+                vmax = np.max(np.abs(heatmap_smooth))
+                if vmax > 0:
+                    heatmap_norm = (heatmap_smooth + vmax) / (2 * vmax)
+                else:
+                    heatmap_norm = heatmap_smooth
+            
+            # Display the original image
+            ax.imshow(image)
+            
+            # Overlay the heatmap
+            if use_positive_only:
+                im = ax.imshow(heatmap_norm, cmap=colormap, alpha=alpha, vmin=0, vmax=1)
+            else:
+                vmax_display = np.max(np.abs(heatmap_smooth))
+                if vmax_display > 0:
+                    im = ax.imshow(heatmap_smooth, cmap=colormap, alpha=alpha, vmin=-vmax_display, vmax=vmax_display)
+                else:
+                    im = ax.imshow(heatmap_smooth, cmap=colormap, alpha=alpha)
+            
+            # Clean styling
+            ax.axis('off')
+            ax.set_title(f'Token: "{token}"', fontsize=14, fontweight='bold', pad=10)
+            
+            # Add individual colorbar for each subplot
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Similarity", fontsize=10)
+        
+        # Hide unused subplots
+        for j in range(num_tokens, len(axes)):
+            axes[j].axis('off')
+        
+        plt.suptitle('Individual Token Impact Analysis', fontsize=16, fontweight='bold', y=0.98)
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.93)  # Make room for suptitle
+        plt.show()
+
+    def analyze_image_text_pair(self, image: Image.Image, text: str, debug: bool = False, 
+                               heatmap_style: str = 'research', show_matrix: bool = True, 
+                               show_individual_tokens: bool = False):
+        """
+        Performs a focused analysis of an image-text pair.
+
+        1. Computes token-patch cosine similarity.
+        2. Optionally displays the full similarity matrix (confusion matrix).
+        3. Displays the overall text impact as a smooth gradient heatmap overlaid on the image.
+        4. Optionally displays individual token impact heatmaps.
+
+        Args:
+            image (Image.Image): The original PIL image.
+            text (str): The text prompt.
+            debug (bool): If True, prints detailed shapes and values.
+            heatmap_style (str): Style of heatmap - 'research', 'thermal', 'attention', or 'classic'.
+            show_matrix (bool): Whether to show the token-patch similarity matrix.
+            show_individual_tokens (bool): Whether to show individual token impact heatmaps.
+        """
+        # Get the core similarity matrix
+        image_input = self.preprocess(image).unsqueeze(0)
+        text_input = tokenize([text])
+        tokens, similarity = self.get_token_patch_similarity(image_input, text_input, debug=debug)
+
+        step_num = 1
+        
+        if show_matrix:
+            print("="*60)
+            print(f"Step {step_num}: Token-Patch Similarity Matrix")
+            print("This shows the raw cosine similarity between every token and every image patch.")
+            print("="*60)
+            self.plot_token_patch_matrix(tokens, similarity)
+            step_num += 1
+            print("\n" + "="*60)
+            print(f"Step {step_num}: Generating Gradient-Style Saliency Heatmap...")
+        else:
+            print("="*60)
+            print(f"Step {step_num}: Generating Gradient-Style Saliency Heatmap...")
+        
+        print("This creates a smooth visualization showing where the text concepts align with the image.")
+        print("="*60)
+        self.visualize_gradient_heatmap(image, similarity, style=heatmap_style)
+        step_num += 1
+
+        if show_individual_tokens:
+            print("\n" + "="*60)
+            print(f"Step {step_num}: Individual Token Impact Analysis")
+            print("This shows how each individual word affects different regions of the image.")
+            print("="*60)
+            self.visualize_individual_token_impacts(image, tokens, similarity, colormap='plasma')
+
+        print("\nAnalysis complete.")
+        return tokens, similarity
+
 def load_interpretable_clip(name: str = "ViT-B/32", device: str = "cuda" if torch.cuda.is_available() else "cpu"):
-    """Load an interpretable version of CLIP."""
+    """
+    Load an interpretable version of CLIP that can compute token-patch similarities.
+    
+    Args:
+        name: CLIP model name (e.g., "ViT-B/32")
+        device: device to load the model on
+        
+    Returns:
+        InterpretableCLIP model with preprocess function and tokenizer attached
+    """
+    # Load standard CLIP model
     model, preprocess = load(name, device=device)
     
-    # Get model parameters from state dict
-    state_dict = model.state_dict()
-    
-    # Get dimensions from state dict
-    embed_dim = state_dict["text_projection"].shape[1]
-    image_resolution = model.visual.input_resolution
-    vision_width = state_dict["visual.conv1.weight"].shape[0]
-    vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
-    transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
-    
+    # Create interpretable version with same architecture
     interpretable_model = InterpretableCLIP(
-        embed_dim=embed_dim,
-        image_resolution=image_resolution,
+        embed_dim=model.visual.proj.shape[1],
+        image_resolution=model.visual.input_resolution,
         vision_layers=len(model.visual.transformer.resblocks),
-        vision_width=vision_width,
-        vision_patch_size=vision_patch_size,
-        context_length=context_length,
-        vocab_size=vocab_size,
-        transformer_width=transformer_width,
-        transformer_heads=transformer_heads,
-        transformer_layers=transformer_layers
+        vision_width=model.visual.transformer.width,
+        vision_patch_size=model.visual.conv1.kernel_size[0],
+        context_length=model.context_length,
+        vocab_size=model.vocab_size,
+        transformer_width=model.transformer.width,
+        transformer_heads=model.transformer.width // 64,
+        transformer_layers=len(model.transformer.resblocks)
     )
     
-    # Copy weights
+    # Load the trained weights
     interpretable_model.load_state_dict(model.state_dict())
-    interpretable_model.preprocess = preprocess
+    interpretable_model = interpretable_model.to(device)
     
-    # Get tokenizer from CLIP module
+    # Attach utilities
+    interpretable_model.preprocess = preprocess
     from .simple_tokenizer import SimpleTokenizer
     interpretable_model.tokenizer = SimpleTokenizer()
     
+    print("Interpretable CLIP loaded successfully!")
     return interpretable_model 
