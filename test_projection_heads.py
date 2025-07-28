@@ -6,7 +6,7 @@ as the original CLIP implementation for both image and text embeddings.
 import torch
 from PIL import Image
 import numpy as np
-from clip.interpretable_clip import load_interpretable_clip
+from clip.interpretable_clip_attention import load_interpretable_clip
 from clip import load as load_original_clip, tokenize
 
 def test_projection_heads_equivalence():

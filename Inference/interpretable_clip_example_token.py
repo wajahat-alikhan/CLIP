@@ -14,7 +14,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 # Add the parent directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from clip.interpretable_clip import load_interpretable_clip
+from clip.interpretable_clip_attention import load_interpretable_clip
 from clip.clip import tokenize
 
 def main():

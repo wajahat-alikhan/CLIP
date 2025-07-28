@@ -9,7 +9,7 @@ import sys
 import os
 import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clip.interpretable_clip import load_interpretable_clip, tokenize
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize
 
 def test_coordinate_fix():
     """Test if coordinate system fixes resolve the inversion issue."""

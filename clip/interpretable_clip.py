@@ -1,5 +1,5 @@
 """
-Interpretable CLIP: Extends original CLIP to enable fine-grained token-patch similarity analysis.
+TCLIP: Extends original CLIP to enable fine-grained token-patch similarity analysis.
 
 This module adds interpretability methods to CLIP models while maintaining perfect compatibility
 with the original implementation. It extracts ALL patch and token embeddings (instead of just 
@@ -45,7 +45,10 @@ def load_interpretable_clip(name: str = "ViT-B/32", device: str = "cuda" if torc
         CLIP model with added interpretability methods:
         - encode_text_with_tokens(): extracts all token embeddings
         - encode_image_with_patches(): extracts all patch embeddings  
-        - get_token_patch_similarity(): computes fine-grained similarity matrix
+        - get_token_patch_similarity(): computes raw cosine similarities
+        - get_token_patch_logits(): computes temperature-scaled logits (CLIP standard)
+        - get_clip_score(): computes CLIP score metrics (0-100 scale)
+        - get_clip_temperature(): gets learned temperature parameter
         - preprocess: original CLIP preprocessing function
     """
     # Load standard CLIP model with original weights
@@ -125,20 +128,15 @@ def load_interpretable_clip(name: str = "ViT-B/32", device: str = "cuda" if torc
             
         return cls_embedding, patch_embeddings
     
-    def get_token_patch_similarity(self, image: torch.Tensor, text: torch.Tensor, debug: bool = False) -> Tuple[List[str], torch.Tensor]:
+    def get_token_patch_logits(self, image: torch.Tensor, text: torch.Tensor, debug: bool = False) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute cosine similarity between text tokens and image patches in CLIP's latent space.
+        Compute comprehensive CLIP logits (temperature-scaled similarities) between text and image embeddings.
         
-        This is the core interpretability function that enables fine-grained analysis of
-        text-image correspondences using CLIP's learned representations.
+        This function computes the same 5 similarity types as get_token_patch_similarity(), but applies
+        CLIP's learned temperature scaling to convert raw cosine similarities into proper logits.
         
-        Technical Process:
-        1. Extract all patch embeddings from image encoder
-        2. Extract all token embeddings from text encoder  
-        3. Apply same projection heads as original CLIP
-        4. L2 normalize both embeddings
-        5. Compute cosine similarity matrix via dot product
-        6. Filter out special tokens (SOT, EOT, padding)
+        CLIP logits = temperature * cosine_similarity
+        where temperature = exp(logit_scale) (learned during training)
         
         Args:
             image: [1, 3, height, width] preprocessed image (batch_size=1 only)
@@ -147,8 +145,79 @@ def load_interpretable_clip(name: str = "ViT-B/32", device: str = "cuda" if torc
             
         Returns:
             tokens: List of meaningful token strings (excluding special tokens)
-            similarity: [num_tokens, num_patches] cosine similarity matrix
-                       Values range [-1, 1] where 1 = perfect alignment, -1 = opposite
+            token_patch_logits: [num_tokens, num_patches] - individual tokens vs patches (scaled)
+            eos_patch_logits: [1, num_patches] - EOS token vs all patches (scaled)
+            cls_token_logits: [1, num_tokens] - CLS token vs all tokens (scaled)
+            eos_token_logits: [1, num_tokens] - EOS token vs all tokens (scaled)
+            cls_patch_logits: [1, num_patches] - CLS token vs all patches (scaled)
+        """
+        # Get raw cosine similarities first
+        tokens, token_patch_sim, eos_patch_sim, cls_token_sim, eos_token_sim, cls_patch_sim = self.get_token_patch_similarity(image, text, debug=debug)
+        
+        # Get CLIP's learned temperature parameter
+        temperature = self.logit_scale.exp()
+        
+        if debug:
+            print(f"CLIP temperature (exp(logit_scale)): {temperature.item():.4f}")
+            print(f"Original logit_scale: {self.logit_scale.item():.4f}")
+        
+        # Apply temperature scaling to convert cosine similarities to logits
+        token_patch_logits = temperature * token_patch_sim
+        eos_patch_logits = temperature * eos_patch_sim
+        cls_token_logits = temperature * cls_token_sim
+        eos_token_logits = temperature * eos_token_sim
+        cls_patch_logits = temperature * cls_patch_sim
+        
+        if debug:
+            print(f"\nLOGITS (after temperature scaling):")
+            print(f"Token-Patch logits range: [{token_patch_logits.min().item():.4f}, {token_patch_logits.max().item():.4f}]")
+            print(f"EOS-Patch logits range: [{eos_patch_logits.min().item():.4f}, {eos_patch_logits.max().item():.4f}]")
+            print(f"CLS-Token logits range: [{cls_token_logits.min().item():.4f}, {cls_token_logits.max().item():.4f}]")
+            print(f"EOS-Token logits range: [{eos_token_logits.min().item():.4f}, {eos_token_logits.max().item():.4f}]")
+            print(f"CLS-Patch logits range: [{cls_patch_logits.min().item():.4f}, {cls_patch_logits.max().item():.4f}]")
+        
+        return tokens, token_patch_logits, eos_patch_logits, cls_token_logits, eos_token_logits, cls_patch_logits
+    
+    def get_clip_temperature(self):
+        """
+        Get CLIP's learned temperature parameter.
+        
+        Returns:
+            temperature: float - The temperature scaling factor (exp(logit_scale))
+        """
+        return self.logit_scale.exp().item()
+
+    def get_token_patch_similarity(self, image: torch.Tensor, text: torch.Tensor, debug: bool = False) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute comprehensive cosine similarities between text and image embeddings in CLIP's latent space.
+        
+        This function computes:
+        1. Fine-grained token-patch similarities (existing functionality)
+        2. EOS token vs all image patches (global text vs local image)
+        3. CLS token vs all text tokens (global image vs local text)
+        4. EOS token vs all text tokens (global text vs local text)
+        5. CLS token vs all image patches (global image vs local image)
+        
+        Technical Process:
+        1. Extract all patch embeddings and CLS embedding from image encoder
+        2. Extract all token embeddings and EOS embedding from text encoder  
+        3. Apply same projection heads as original CLIP
+        4. L2 normalize all embeddings
+        5. Compute five similarity matrices via dot product
+        6. Filter out special tokens for meaningful analysis
+        
+        Args:
+            image: [1, 3, height, width] preprocessed image (batch_size=1 only)
+            text: [1, sequence_length] tokenized text (batch_size=1 only)
+            debug: whether to print debug information
+            
+        Returns:
+            tokens: List of meaningful token strings (excluding special tokens)
+            token_patch_similarity: [num_tokens, num_patches] - individual tokens vs patches
+            eos_patch_similarity: [1, num_patches] - EOS token vs all patches
+            cls_token_similarity: [1, num_tokens] - CLS token vs all tokens
+            eos_token_similarity: [1, num_tokens] - EOS token vs all tokens
+            cls_patch_similarity: [1, num_patches] - CLS token vs all patches
         """
         if debug:
             print(f"Input shapes - Image: {image.shape}, Text: {text.shape}")
@@ -161,18 +230,21 @@ def load_interpretable_clip(name: str = "ViT-B/32", device: str = "cuda" if torc
         text = text.to(next(self.parameters()).device)
         
         # Extract all embeddings using same processing as original CLIP
-        _, patch_embeddings = self.encode_image_with_patches(image)  # [1, num_patches, embed_dim]
-        _, token_embeddings = self.encode_text_with_tokens(text)     # [1, seq_len, embed_dim]
+        cls_embedding, patch_embeddings = self.encode_image_with_patches(image)  # [1, embed_dim], [1, num_patches, embed_dim]
+        eos_embedding, token_embeddings = self.encode_text_with_tokens(text)     # [1, embed_dim], [1, seq_len, embed_dim]
         
         if debug:
             print(f"Extracted embeddings - Patches: {patch_embeddings.shape}, Tokens: {token_embeddings.shape}")
+            print(f"Global embeddings - CLS: {cls_embedding.shape}, EOS: {eos_embedding.shape}")
         
         # Apply text projection to put tokens in same space as patches (same as original CLIP)
         token_embeddings_proj = torch.matmul(token_embeddings, self.text_projection)
         
-        # L2 normalize both embeddings for cosine similarity (identical to original CLIP)
+        # L2 normalize all embeddings for cosine similarity (identical to original CLIP)
         patch_embeddings_norm = F.normalize(patch_embeddings, dim=-1)
         token_embeddings_norm = F.normalize(token_embeddings_proj, dim=-1)
+        cls_embedding_norm = F.normalize(cls_embedding, dim=-1)
+        eos_embedding_norm = F.normalize(eos_embedding, dim=-1)
         
         # Decode token strings for interpretability
         from .simple_tokenizer import SimpleTokenizer
@@ -202,30 +274,163 @@ def load_interpretable_clip(name: str = "ViT-B/32", device: str = "cuda" if torc
         # Extract meaningful token embeddings
         token_embeddings_real = token_embeddings_norm[0, real_token_indices, :]
         
-        # Compute cosine similarity matrix: [num_real_tokens, num_patches]
-        # This is pure cosine similarity: normalized_dot_product = cosine_similarity
-        similarity = torch.matmul(token_embeddings_real, patch_embeddings_norm[0].transpose(0, 1))
+        # 1. Compute token-patch similarities: [num_real_tokens, num_patches]
+        token_patch_similarity = torch.matmul(token_embeddings_real, patch_embeddings_norm[0].transpose(0, 1))
+        
+        # 2. Compute EOS vs all patches: [1, num_patches] 
+        # This shows how the global text meaning aligns with each image region
+        eos_patch_similarity = torch.matmul(eos_embedding_norm, patch_embeddings_norm[0].transpose(0, 1))
+        
+        # 3. Compute CLS vs all meaningful tokens: [1, num_real_tokens]
+        # This shows how the global image meaning aligns with each text token
+        cls_token_similarity = torch.matmul(cls_embedding_norm, token_embeddings_real.transpose(0, 1))
+        
+        # 4. Compute EOS vs all meaningful tokens: [1, num_real_tokens]
+        # This shows how the global text meaning aligns with each individual word
+        eos_token_similarity = torch.matmul(eos_embedding_norm, token_embeddings_real.transpose(0, 1))
+        
+        # 5. Compute CLS vs all patches: [1, num_patches]
+        # This shows how the global image meaning aligns with each image region
+        cls_patch_similarity = torch.matmul(cls_embedding_norm, patch_embeddings_norm[0].transpose(0, 1))
         
         if debug:
-            print(f"Final similarity matrix: {similarity.shape}")
-            print(f"Similarity range: [{similarity.min().item():.4f}, {similarity.max().item():.4f}]")
+            print(f"Token-Patch similarity: {token_patch_similarity.shape}")
+            print(f"EOS-Patch similarity: {eos_patch_similarity.shape}")
+            print(f"CLS-Token similarity: {cls_token_similarity.shape}")
+            print(f"EOS-Token similarity: {eos_token_similarity.shape}")
+            print(f"CLS-Patch similarity: {cls_patch_similarity.shape}")
+            print(f"Token-Patch range: [{token_patch_similarity.min().item():.4f}, {token_patch_similarity.max().item():.4f}]")
+            print(f"EOS-Patch range: [{eos_patch_similarity.min().item():.4f}, {eos_patch_similarity.max().item():.4f}]")
+            print(f"CLS-Token range: [{cls_token_similarity.min().item():.4f}, {cls_token_similarity.max().item():.4f}]")
+            print(f"EOS-Token range: [{eos_token_similarity.min().item():.4f}, {eos_token_similarity.max().item():.4f}]")
+            print(f"CLS-Patch range: [{cls_patch_similarity.min().item():.4f}, {cls_patch_similarity.max().item():.4f}]")
         
-        return tokens_clean, similarity
+        return tokens_clean, token_patch_similarity, eos_patch_similarity, cls_token_similarity, eos_token_similarity, cls_patch_similarity
+
+    def get_clip_score(self, image: torch.Tensor, text: torch.Tensor, score_type: str = "global", debug: bool = False) -> dict:
+        """
+        Compute CLIP score(s) between image and text.
+        
+        CLIP score is a metric that measures text-image similarity, commonly used for:
+        - Image captioning evaluation
+        - Text-to-image generation assessment
+        - General multimodal similarity measurement
+        
+        Args:
+            image: [1, 3, height, width] preprocessed image tensor
+            text: [1, context_length] tokenized text tensor
+            score_type: Type of score to compute
+                - "global": Global similarity (CLS token vs EOS token)
+                - "max": Maximum similarity across all token-patch pairs
+                - "mean": Mean similarity across all token-patch pairs
+                - "all": All score types
+            debug: If True, prints detailed information
+            
+        Returns:
+            Dictionary containing:
+            - "global_score": Global CLIP score (0-100 scale)
+            - "max_score": Maximum token-patch score (if requested)
+            - "mean_score": Mean token-patch score (if requested)
+            - "temperature": Temperature parameter used
+            - "raw_similarity": Raw cosine similarity before scaling
+            - "logit": Raw logit before scaling to 0-100
+        """
+        with torch.no_grad():
+            # Get logits using existing method
+            tokens, token_patch_logits, eos_patch_logits, cls_token_logits, eos_token_logits, cls_patch_logits = self.get_token_patch_logits(image, text, debug=False)
+            
+            # Get temperature for reference
+            temperature = self.get_clip_temperature()
+            
+            # Compute global CLIP score (standard method)
+            # The global score should be the similarity between CLS (image) and EOS (text) embeddings
+            # We need to extract the EOS embedding and compute CLS @ EOS similarity
+            
+            # Get the CLS and EOS embeddings from the similarity computation
+            cls_embedding, patch_embeddings = self.encode_image_with_patches(image)
+            pooled_embedding, token_embeddings = self.encode_text_with_tokens(text)
+            
+            # Compute the direct global similarity (CLS @ EOS)
+            cls_normalized = cls_embedding / cls_embedding.norm(dim=1, keepdim=True)
+            eos_normalized = pooled_embedding / pooled_embedding.norm(dim=1, keepdim=True)
+            global_similarity = (cls_normalized @ eos_normalized.T).item()
+            
+            # Apply temperature scaling to get logit
+            global_logit = temperature * global_similarity
+            global_score = (global_similarity + 1) * 50  # Scale from [-1,1] to [0,100]
+            
+            results = {
+                "global_score": global_score,
+                "temperature": temperature,
+                "raw_similarity": global_similarity,
+                "logit": global_logit
+            }
+            
+            if score_type in ["max", "all"]:
+                # Maximum similarity across all token-patch pairs
+                max_logit = token_patch_logits.max().item()
+                max_similarity = max_logit / temperature
+                max_score = (max_similarity + 1) * 50
+                results["max_score"] = max_score
+                results["max_raw_similarity"] = max_similarity
+                results["max_logit"] = max_logit
+            
+            if score_type in ["mean", "all"]:
+                # Mean similarity across all token-patch pairs
+                mean_logit = token_patch_logits.mean().item()
+                mean_similarity = mean_logit / temperature
+                mean_score = (mean_similarity + 1) * 50
+                results["mean_score"] = mean_score
+                results["mean_raw_similarity"] = mean_similarity
+                results["mean_logit"] = mean_logit
+            
+            if debug:
+                print(f"🎯 CLIP Score Analysis:")
+                print(f"   Global Score: {global_score:.2f}/100 (similarity: {global_similarity:.4f})")
+                if "max_score" in results:
+                    print(f"   Max Score: {results['max_score']:.2f}/100 (similarity: {results['max_raw_similarity']:.4f})")
+                if "mean_score" in results:
+                    print(f"   Mean Score: {results['mean_score']:.2f}/100 (similarity: {results['mean_raw_similarity']:.4f})")
+                print(f"   Temperature: {temperature:.4f}")
+                print(f"   Score interpretation:")
+                print(f"     90-100: Excellent match")
+                print(f"     70-89:  Good match")
+                print(f"     50-69:  Moderate match")
+                print(f"     30-49:  Poor match")
+                print(f"     0-29:   Very poor match")
+            
+            return results
 
     # Add interpretability methods to the existing CLIP model
     import types
     model.encode_text_with_tokens = types.MethodType(encode_text_with_tokens, model)
     model.encode_image_with_patches = types.MethodType(encode_image_with_patches, model)
     model.get_token_patch_similarity = types.MethodType(get_token_patch_similarity, model)
+    model.get_token_patch_logits = types.MethodType(get_token_patch_logits, model)
+    model.get_clip_temperature = types.MethodType(get_clip_temperature, model)
+    model.get_clip_score = types.MethodType(get_clip_score, model)
     
     # Attach preprocessing function for convenience
     model.preprocess = preprocess
     
     # Print model info
     grid_size = model.visual.input_resolution // model.visual.conv1.kernel_size[0]
+    temperature = model.get_clip_temperature()
     print(f"Interpretable CLIP ({name}) loaded successfully!")
     print(f"Grid size: {grid_size}×{grid_size} = {grid_size**2} patches")
+    print(f"Temperature: {temperature:.4f} (learned scaling factor)")
     print(f"Enables fine-grained analysis of {grid_size**2} image regions × text tokens")
+    print(f"")
+    print(f"📊 Available methods:")
+    print(f"  • get_token_patch_similarity() - Raw cosine similarities [-1, 1]")
+    print(f"  • get_token_patch_logits() - Temperature-scaled logits (CLIP standard)")
+    print(f"  • get_clip_temperature() - Get learned temperature parameter")
+    print(f"  • encode_text_with_tokens() - Extract all token embeddings")
+    print(f"  • encode_image_with_patches() - Extract all patch embeddings")
+    print(f"  • get_clip_score() - Compute CLIP score metrics")
+    print(f"")
+    print(f"💡 Recommended: Use get_token_patch_logits() for standard CLIP analysis")
+    print(f"   Use get_token_patch_similarity() for normalized similarity analysis")
     
     return model
 
@@ -245,10 +450,26 @@ model = load_interpretable_clip("ViT-B/32")
 image = model.preprocess(PIL_image).unsqueeze(0)
 text = tokenize_text("a photo of a cat")
 
-# Get fine-grained similarities
-tokens, similarity = model.get_token_patch_similarity(image, text)
+# Get CLIP score (recommended for evaluation)
+score_results = model.get_clip_score(image, text, score_type="all", debug=True)
+print(f"CLIP Score: {score_results['global_score']:.2f}/100")
+
+# Get CLIP logits (temperature-scaled similarities)
+tokens, token_patch_logits, eos_patch_logits, cls_token_logits, eos_token_logits, cls_patch_logits = model.get_token_patch_logits(image, text)
+
+# Get raw cosine similarities (for normalized analysis)
+tokens, token_patch_sim, eos_patch_sim, cls_token_sim, eos_token_sim, cls_patch_sim = model.get_token_patch_similarity(image, text)
+
+# Get temperature parameter
+temperature = model.get_clip_temperature()
+print(f"CLIP temperature: {temperature:.4f}")
 
 # Results:
 # tokens: ['a', 'photo', 'of', 'a', 'cat'] 
-# similarity: [5, 49] matrix showing how each word aligns with each image patch
+# token_patch_logits: [5, 49] - each word vs each patch (temperature-scaled)
+# eos_patch_logits: [1, 49] - sentence vs each patch (temperature-scaled)
+# cls_token_logits: [1, 5] - image vs each word (temperature-scaled)
+# eos_token_logits: [1, 1] - global image-text similarity (temperature-scaled)
+# cls_patch_logits: [1, 49] - global text vs each patch (temperature-scaled)
+# score_results: {'global_score': 72.5, 'max_score': 85.3, 'mean_score': 68.1, ...}
 """ 

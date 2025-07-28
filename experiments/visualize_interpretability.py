@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 # Import the interpretable CLIP module
 import sys
 sys.path.append('..')
-from clip.interpretable_clip import load_interpretable_clip, tokenize_text
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize_text
 
 # Set style for publication-quality plots
 plt.style.use('seaborn-v0_8-whitegrid')

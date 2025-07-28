@@ -8,7 +8,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
-from clip.interpretable_clip import load_interpretable_clip, tokenize_text
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize_text
 
 def create_simple_test_image(size=224):
     """Create a very simple test image with clear features"""

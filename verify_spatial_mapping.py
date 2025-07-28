@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
-from clip.interpretable_clip import load_interpretable_clip, tokenize_text
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize_text
 
 def create_test_image_with_markers(size=224, grid_size=14):
     """

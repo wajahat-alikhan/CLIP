@@ -6,7 +6,7 @@ EXACTLY the same way as the original CLIP implementation.
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from clip.interpretable_clip import load_interpretable_clip
+from clip.interpretable_clip_attention import load_interpretable_clip
 from clip import load as load_original_clip, tokenize
 
 def test_l2_normalization_equivalence():

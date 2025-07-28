@@ -21,7 +21,7 @@ import cv2
 from PIL import Image
 from pathlib import Path
 import matplotlib.cm as cm
-from clip.interpretable_clip import load_interpretable_clip, tokenize_text
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize_text
 
 class CAMSaliencyGenerator:
     """Generates CAM-style saliency maps for interpretable CLIP"""

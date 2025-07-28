@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from clip.interpretable_clip import load_interpretable_clip
+from clip.interpretable_clip_attention import load_interpretable_clip
 from clip import load as load_original_clip, tokenize
 from PIL import Image
 

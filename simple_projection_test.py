@@ -1,5 +1,5 @@
 import torch
-from clip.interpretable_clip import load_interpretable_clip
+from clip.interpretable_clip_attention import load_interpretable_clip
 from clip import load as load_original_clip
 
 print("Loading models...")

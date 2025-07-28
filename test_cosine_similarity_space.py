@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 import numpy as np
-from clip.interpretable_clip import load_interpretable_clip
+from clip.interpretable_clip_attention import load_interpretable_clip
 from clip import load as load_original_clip, tokenize
 
 def test_cosine_similarity_latent_space():

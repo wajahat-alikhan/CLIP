@@ -1,0 +1,26 @@
+[
+  {
+    "image": "dogcat2.png",
+    "text": "a photo of a cat",
+    "alpha": 0.0,
+    "alpha_label": "attention-only",
+    "mean_similarity": 0.18785251677036285,
+    "max_similarity": 0.26290398836135864
+  },
+  {
+    "image": "dogcat2.png",
+    "text": "a photo of a cat",
+    "alpha": 0.5,
+    "alpha_label": "balanced",
+    "mean_similarity": 0.18785253167152405,
+    "max_similarity": 0.26290398836135864
+  },
+  {
+    "image": "dogcat2.png",
+    "text": "a photo of a cat",
+    "alpha": 1.0,
+    "alpha_label": "gradient-only",
+    "mean_similarity": 0.18785250186920166,
+    "max_similarity": 0.26290398836135864
+  }
+]

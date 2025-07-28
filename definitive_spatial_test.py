@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
-from clip.interpretable_clip import load_interpretable_clip, tokenize_text
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize_text
 
 def create_numbered_grid_image(size=224, grid_size=14):
     """Create an image with each patch showing its expected index number"""

@@ -10,7 +10,7 @@ import sys
 import os
 import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from clip.interpretable_clip import load_interpretable_clip, tokenize
+from clip.interpretable_clip_attention import load_interpretable_clip, tokenize
 from clip import load as load_standard_clip
 
 def debug_mathematical_operations():
