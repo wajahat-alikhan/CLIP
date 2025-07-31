@@ -1245,9 +1245,9 @@ def main():
     model = load_interpretable_clip("ViT-B/32", device="cuda" if torch.cuda.is_available() else "cpu")
     
     # Load image and set text prompt
-    image_path = r"D:/Wajahat Ali Khan/CLIP/images/cat.png"
+    image_path = r"D:/Wajahat Ali Khan/CLIP/images/among.jpg"
     image = Image.open(image_path).convert("RGB")
-    text = "a photo of a cat"
+    text = "a woman is smiling among a group of people"
     
     print(f"\nAnalyzing image: {image_path}")
     print(f"Text prompt: '{text}'")
